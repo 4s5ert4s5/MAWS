@@ -1,6 +1,7 @@
 """
-MAWS v0.2 原型 —— 多智能体写作工作室
+MAWS v0.2.1 原型 —— 多智能体写作工作室
 三个 AI 导师陪你写,不替你写。
+(v0.2.1 修复:点击"发送"后清空输入框导致的报错)
 """
 import os, json, datetime, re
 import streamlit as st
@@ -8,7 +9,9 @@ from openai import OpenAI
 
 st.set_page_config(page_title="MAWS 写作工作室 · 原型", page_icon="✍️", layout="wide")
 
-# ---------- 配置:自动从云端 Secrets 或本地环境变量读取 ----------
+CODE_VERSION = "0.2.1"
+
+# ---------- 配置:云端从 Secrets 读取,本地从环境变量读取 ----------
 def cfg(key: str, default: str = "") -> str:
     try:
         v = st.secrets[key]
@@ -90,14 +93,13 @@ SAMPLE_PARAGRAPH = (
 
 # ---------- 会话状态 ----------
 def init_state():
-    if "history" not in st.session_state:
-        st.session_state["history"] = {n: [] for n in AGENTS}
-    if "stances" not in st.session_state:
-        st.session_state["stances"] = {n: "" for n in AGENTS}
-    if "log" not in st.session_state:
-        st.session_state["log"] = []
-    if "roundtable" not in st.session_state:
-        st.session_state["roundtable"] = {}
+    defaults = [("history", {n: [] for n in AGENTS}),
+                ("stances", {n: "" for n in AGENTS}),
+                ("log", []),
+                ("roundtable", {})]
+    for key, val in defaults:
+        if key not in st.session_state:
+            st.session_state[key] = val
 
 init_state()
 
@@ -125,7 +127,7 @@ def ask(name, draft, stage, history, user_msg, force_example=False, include_dige
             model=MODEL, messages=messages, temperature=AGENTS[name]["temp"])
         reply = resp.choices[0].message.content
     except Exception as e:
-        st.error(f"调用失败:{e}\n请检查 OPENAI_API_KEY / OPENAI_BASE_URL / MAWS_MODEL")
+        st.error(f"调用失败:{e}\n请检查 Secrets 中的 OPENAI_API_KEY / OPENAI_BASE_URL / MAWS_MODEL")
         return None
     history.append({"role": "user", "content": user_msg.strip()})
     history.append({"role": "assistant", "content": reply})
@@ -153,21 +155,36 @@ def run_roundtable(draft, stage, focus):
 
 # ---------- 界面 ----------
 st.title("✍️ MAWS 写作工作室(原型)")
-st.caption(f"模型:{MODEL} · Prompt {PROMPT_VERSION} · 三个 AI 导师陪你写,不替你写")
+st.caption(f"模型:{MODEL} · Prompt {PROMPT_VERSION} · 界面 v{CODE_VERSION} · 三个 AI 导师陪你写,不替你写")
+
+# 回调:清空所有对话(回调在页面重绘前执行,可以安全清空输入框)
+def clear_all():
+    for n in AGENTS:
+        st.session_state["history"][n] = []
+        st.session_state["stances"][n] = ""
+        st.session_state.pop(f"in_{n}", None)
+        st.session_state.pop(f"pending_{n}", None)
+    st.session_state["roundtable"] = {}
+    st.session_state["log"] = []
+
+# 回调:载入示例段落
+def load_sample():
+    st.session_state["draft"] = SAMPLE_PARAGRAPH
+
+# 回调:发送(先把输入存入"待发送"中转站,再清空输入框)
+def make_send(name):
+    def _send():
+        msg = (st.session_state.get(f"in_{name}", "") or "").strip()
+        if msg:
+            st.session_state[f"pending_{name}"] = msg
+            st.session_state[f"in_{name}"] = ""
+    return _send
 
 with st.sidebar:
     stage = st.radio("写作阶段", list(STAGES.keys()))
     st.divider()
-    if st.button("🗑️ 清空所有对话"):
-        st.session_state["history"] = {n: [] for n in AGENTS}
-        st.session_state["stances"] = {n: "" for n in AGENTS}
-        st.session_state["roundtable"] = {}
-        st.session_state["log"] = []
-        st.rerun()
-    st.caption("提示:用 OPENAI_BASE_URL 可接入 DeepSeek 等兼容接口。")
-
-def load_sample():
-    st.session_state["draft"] = SAMPLE_PARAGRAPH
+    st.button("🗑️ 清空所有对话", on_click=clear_all)
+    st.caption("清空只影响你自己当前的会话。")
 
 st.button("📄 载入示例段落(快速测试用)", on_click=load_sample)
 draft = st.text_area("我的草稿", key="draft", height=240,
@@ -180,18 +197,19 @@ for tab, name in zip(tabs, AGENTS):
         h = st.session_state["history"][name]
         if not h:
             st.info(f"{AGENTS[name]['icon']} {name}已就位。{AGENTS[name]['hint']}")
+        # 处理"待发送"消息:先调用、更新历史,再渲染
+        pending = st.session_state.pop(f"pending_{name}", None)
+        if pending:
+            force = (name == "支持者") and st.session_state.get("req_example", False)
+            with st.spinner(f"{name}思考中……"):
+                ask(name, draft, stage, h, pending, force_example=force)
         for m in h:
             with st.chat_message("user" if m["role"] == "user" else "assistant"):
                 st.markdown(m["content"])
-        force = False
         if name == "支持者":
-            force = st.checkbox("✅ 我明确请求示例(勾选后支持者才会给示例)", key="req_example")
-        msg = st.text_area("对TA说……", key=f"in_{name}", height=70)
-        if st.button("发送", key=f"go_{name}") and msg.strip():
-            with st.spinner(f"{name}思考中……"):
-                ask(name, draft, stage, h, msg, force_example=force)
-            st.session_state[f"in_{name}"] = ""
-            st.rerun()
+            st.checkbox("✅ 我明确请求示例(勾选后支持者才会给示例)", key="req_example")
+        st.text_area("对TA说……", key=f"in_{name}", height=70)
+        st.button("发送", key=f"go_{name}", on_click=make_send(name))
 
 with tabs[3]:
     focus = st.text_input("这次最想让导师们关注什么?(可选)", key="focus")
